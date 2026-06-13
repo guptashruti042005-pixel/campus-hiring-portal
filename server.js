@@ -1,36 +1,34 @@
 require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2');
-const app = express();
+const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const JWT_SECRET = process.env.JWT_SECRET;
-const cors = require('cors');
+
+// NEW: Socket.io needs these two
+const http = require('http');
+const { Server } = require('socket.io');
+
+const app = express();
 app.use(cors());
-
-// Middleware: the "security guard" that checks for a valid token
-function verifyToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-
-  // No header at all -> blocked
-  if (!authHeader) {
-    return res.status(401).json({ message: 'No token provided' });
-  }
-
-  // Header looks like "Bearer eyJhbGci..." -> grab just the token part
-  const token = authHeader.split(' ')[1];
-
-  // Verify the token using our secret
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(403).json({ message: 'Invalid or expired token' });
-    }
-    req.user = decoded;   // attach the user info to the request
-    next();               // token valid -> let the request continue
-  });
-}
-
 app.use(express.json());
+
+// NEW: wrap the Express app in an HTTP server, then attach Socket.io to it
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: 'http://localhost:5173' },   // allow our React app to connect
+});
+
+// NEW: runs whenever a client connects via Socket.io
+io.on('connection', (socket) => {
+  console.log('A user connected:', socket.id);
+
+  socket.on('disconnect', () => {
+    console.log('A user disconnected:', socket.id);
+  });
+});
+
+const JWT_SECRET = process.env.JWT_SECRET;
 
 const db = mysql.createConnection({
   host: 'localhost',
@@ -61,7 +59,7 @@ app.get('/jobs', (req, res) => {
   });
 });
 
-app.post('/jobs', (req, res) => {
+app.post('/jobs', verifyToken, (req, res) => {
   const { title, company } = req.body;
   db.query(
     'INSERT INTO jobs (title, company) VALUES (?, ?)',
@@ -71,25 +69,26 @@ app.post('/jobs', (req, res) => {
         res.status(500).send('Error adding job');
         return;
       }
+
+      const newJob = { id: result.insertId, title, company };
+
+      // NEW: announce the new job to ALL connected clients, instantly
+      io.emit('newJob', newJob);
+
       res.json({ message: 'Job added!', id: result.insertId });
     }
   );
 });
 
-// REGISTER a new user
 app.post('/register', async (req, res) => {
   const { name, email, password } = req.body;
-
   try {
-    // Hash the password before storing it. 10 = "salt rounds" (work factor).
     const hashedPassword = await bcrypt.hash(password, 10);
-
     db.query(
       'INSERT INTO users (name, email, password) VALUES (?, ?, ?)',
       [name, email, hashedPassword],
       (err, result) => {
         if (err) {
-          // If email already exists, MySQL throws a duplicate error
           if (err.code === 'ER_DUP_ENTRY') {
             return res.status(400).json({ message: 'Email already registered' });
           }
@@ -102,49 +101,86 @@ app.post('/register', async (req, res) => {
     res.status(500).json({ message: 'Something went wrong' });
   }
 });
-// LOGIN a user
+
 app.post('/login', (req, res) => {
   const { email, password } = req.body;
-
-  // Step 1: find the user by email
   db.query('SELECT * FROM users WHERE email = ?', [email], async (err, results) => {
     if (err) {
       return res.status(500).json({ message: 'Server error' });
     }
-
-    // No user with that email
     if (results.length === 0) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
-
     const user = results[0];
-
-    // Step 2: compare typed password against the stored hash
     const isMatch = await bcrypt.compare(password, user.password);
-
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
-
-    // Step 3: password correct -> create a JWT
     const token = jwt.sign(
-      { id: user.id, email: user.email },   // data stored inside the token
-      JWT_SECRET,                            // secret used to sign it
-      { expiresIn: '1h' }                    // token expires in 1 hour
+      { id: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '1h' }
     );
-
     res.json({ message: 'Login successful!', token });
   });
 });
 
-// PROTECTED route - only works with a valid token
-app.get('/profile', verifyToken, (req, res) => {
-  res.json({
-    message: 'This is protected data',
-    user: req.user,   // the id + email we baked into the token
+function verifyToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) {
+    return res.status(401).json({ message: 'No token provided' });
+  }
+  const token = authHeader.split(' ')[1];
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid or expired token' });
+    }
+    req.user = decoded;
+    next();
   });
+}
+
+app.get('/profile', verifyToken, (req, res) => {
+  res.json({ message: 'This is protected data', user: req.user });
 });
 
-app.listen(5000, () => {
+// APPLY to a job
+app.post('/apply', verifyToken , (req, res) => {
+  const { job_id, user_id } = req.body;
+  db.query(
+    'INSERT INTO applications (job_id, user_id) VALUES (?, ?)',
+    [job_id, user_id],
+    (err, result) => {
+      if (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+          return res.status(400).json({ message: 'Already applied to this job' });
+        }
+        return res.status(500).json({ message: 'Error applying' });
+      }
+      res.json({ message: 'Applied successfully!', id: result.insertId });
+    }
+  );
+});
+
+// GET applications for a user (with JOIN to get job details)
+app.get('/applications/:userId', (req, res) => {
+  const { userId } = req.params;
+  db.query(
+    `SELECT applications.id, jobs.title, jobs.company, applications.applied_at
+     FROM applications
+     JOIN jobs ON applications.job_id = jobs.id
+     WHERE applications.user_id = ?`,
+    [userId],
+    (err, results) => {
+      if (err) {
+        return res.status(500).json({ message: 'Error fetching applications' });
+      }
+      res.json(results);
+    }
+  );
+});
+
+// CHANGED: server.listen instead of app.listen
+server.listen(5000, () => {
   console.log('Server is running on port 5000');
 });
