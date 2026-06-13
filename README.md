@@ -21,7 +21,15 @@ Protected routes that require a valid token (middleware-based auth)
 
 API Endpoints
 
-MethodEndpointDescriptionProtectedGET/jobsGet all jobsNoPOST/jobsAdd a new jobNoPOST/registerRegister a new userNoPOST/loginLog in and receive a JWTNoGET/profileGet logged-in user data (token req.)Yes
+## API Endpoints
+
+| Method | Endpoint    | Description                          | Protected |
+|--------|-------------|--------------------------------------|-----------|
+| GET    | `/jobs`     | Get all jobs                         | No        |
+| POST   | `/jobs`     | Add a new job                        | No        |
+| POST   | `/register` | Register a new user                  | No        |
+| POST   | `/login`    | Log in and receive a JWT             | No        |
+| GET    | `/profile`  | Get logged-in user data (token req.) | Yes       |
 
 Project Structure
 
